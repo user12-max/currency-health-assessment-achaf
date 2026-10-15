@@ -76,7 +76,7 @@ def _build_directional_line_kernels(length: int) -> List[np.ndarray]:
             (center - dx, center - dy),
             (center + dx, center + dy),
             1,
-            thickness=2,
+            thickness=1,
         )
         kernels.append(kern)
     return kernels
@@ -93,9 +93,10 @@ def _compute_anisotropic_fold_response(
        Applying directional line opening (`MORPH_OPEN` with a long 1D line kernel `dk`)
        directly to the trough map eliminates broken character strings while preserving
        continuous fold lines.
-    2. Flat printed security threads or border stripes are purely absorptive (never
-       brighter than the local paper background), whereas physical creases exhibit an
-       adjacent bright highlight/wear ridge above the local paper median.
+    2. Real physical creases and edge rolls appear as dark troughs (collected dirt/shadows)
+       and/or light ridges (paper fiber wear/highlights). Combining directional openings
+       across both polarities ensures circulated fold lines and edge rolls are captured
+       robustly.
     """
     iso_k = max(5, base_ksize)
     if iso_k % 2 == 0:
@@ -103,7 +104,7 @@ def _compute_anisotropic_fold_response(
     ell_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (iso_k, iso_k))
 
     gray_f = gray.astype(np.float32)
-    # Estimate local paper baseline intensity using a wider median/Gaussian blur
+    # Estimate local paper baseline intensity using Gaussian blur
     bg_k = max(15, iso_k * 3)
     if bg_k % 2 == 0:
         bg_k += 1
@@ -113,7 +114,7 @@ def _compute_anisotropic_fold_response(
     trough_map = np.maximum(0.0, paper_base - gray_f)
     ridge_map = np.maximum(0.0, gray_f - paper_base)
 
-    # Suppress wide solid ink blocks by opening with an isotropic kernel
+    # Suppress wide solid ink blocks by subtracting isotropic opening
     trough_thin = np.maximum(
         0.0, trough_map - cv2.morphologyEx(trough_map, cv2.MORPH_OPEN, ell_kernel)
     )
@@ -121,9 +122,8 @@ def _compute_anisotropic_fold_response(
         0.0, ridge_map - cv2.morphologyEx(ridge_map, cv2.MORPH_OPEN, ell_kernel)
     )
 
-    line_len = max(15, iso_k * 3 + 1)
+    line_len = max(11, iso_k * 2 + 1)
     dir_kernels = _build_directional_line_kernels(line_len)
-    couple_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (iso_k, iso_k))
 
     dir_responses = []
     for dk in dir_kernels:
@@ -131,17 +131,14 @@ def _compute_anisotropic_fold_response(
         cont_trough = cv2.morphologyEx(trough_thin, cv2.MORPH_OPEN, dk)
         cont_ridge = cv2.morphologyEx(ridge_thin, cv2.MORPH_OPEN, dk)
 
-        # Require coupled continuous trough + adjacent continuous ridge
-        ridge_dil = cv2.dilate(cont_ridge, couple_k)
-        coupled_dir = np.sqrt(cont_trough * np.maximum(ridge_dil, 1.0)) * (
-            np.clip(ridge_dil / 4.0, 0.15, 1.5)
-        )
+        # Physical creases exhibit either dark absorptive valleys, bright wear ridges, or both
+        coupled_dir = np.maximum(cont_trough, cont_ridge * 0.85)
         dir_responses.append(coupled_dir)
 
     stack_dir = np.stack(dir_responses, axis=0)
     max_dir = np.max(stack_dir, axis=0)
-    min_dir = np.min(stack_dir, axis=0)
-    anisotropic = np.maximum(0.0, max_dir - 0.75 * min_dir) * 3.2
+    mean_dir = np.mean(stack_dir, axis=0)
+    anisotropic = np.maximum(0.0, max_dir - 0.70 * mean_dir) * 1.6
 
     return np.clip(anisotropic, 0, 255).astype(np.uint8)
 
@@ -175,6 +172,24 @@ def _deduplicate_line_segments(
         if not is_dup:
             kept.append(cand)
     return kept
+
+
+def _is_printed_border_frame(
+    x1: int, y1: int, x2: int, y2: int, length_px: float, orientation_deg: float, h: int, w: int
+) -> bool:
+    """Filter out full-length printed artwork border frames parallel to the edge."""
+    is_horiz = min(orientation_deg, 180.0 - orientation_deg) <= 2.0
+    is_vert = abs(orientation_deg - 90.0) <= 2.0
+
+    if is_horiz and length_px > 0.55 * float(w):
+        mean_y = 0.5 * (y1 + y2)
+        if mean_y < 0.08 * float(h) or mean_y > 0.92 * float(h):
+            return True
+    if is_vert and length_px > 0.55 * float(h):
+        mean_x = 0.5 * (x1 + x2)
+        if mean_x < 0.08 * float(w) or mean_x > 0.92 * float(w):
+            return True
+    return False
 
 
 def analyze_morphology(
@@ -246,15 +261,14 @@ def analyze_morphology(
         )
         fold_resp = np.clip(diff_resp, 0, 255).astype(np.uint8)
 
-    # Exclude outer 8% boundary so outer frame borders are not detected as internal folds
+    # Exclude outermost 2% boundary to prevent perspective warp edge discretization artifacts,
+    # while preserving edge-rolling creases and corner folds in the outer 3% to 12% margin
+    border_cut = max(4, int(round(min(h, w) * 0.02)))
     interior_mask = np.zeros((h, w), dtype=np.uint8)
-    mh = max(8, int(round(h * 0.08)))
-    mw = max(8, int(round(w * 0.08)))
-    interior_mask[mh : h - mh, mw : w - mw] = 255
+    interior_mask[border_cut : h - border_cut, border_cut : w - border_cut] = 255
     if rectified_mask is not None:
-        erode_b = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (mh, mh))
-        eroded_fg = cv2.erode(rectified_mask, erode_b)
-        interior_mask = cv2.bitwise_and(interior_mask, eroded_fg)
+        erode_fg = cv2.erode(rectified_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)))
+        interior_mask = cv2.bitwise_and(interior_mask, erode_fg)
 
     masked_fold_resp = cv2.bitwise_and(fold_resp, interior_mask)
 
@@ -266,20 +280,20 @@ def analyze_morphology(
         p98 = 20.0
 
     # Require a meaningful absolute coupled contrast so clean notes aren't triggered
-    min_abs_thresh = max(16.0, 24.0 / sens)
+    min_abs_thresh = max(18.0, 24.0 / sens)
     thresh_val = max(min_abs_thresh, p98 * (0.90 / (sens ** 0.35)))
     _, raw_cand = cv2.threshold(
         masked_fold_resp, int(round(min(245.0, thresh_val))), 255, cv2.THRESH_BINARY
     )
 
-    # Probabilistic Hough Transform on candidate pixels to find long linear creases
-    min_line_len = max(int(round(h * 0.32)), 55)
-    max_line_gap = max(int(round(h * 0.04)), 8)
+    # Probabilistic Hough Transform on candidate pixels to find long linear creases and edge rolls
+    min_line_len = max(int(round(h * 0.09)), 35)
+    max_line_gap = max(int(round(h * 0.03)), 10)
     lines = cv2.HoughLinesP(
         raw_cand,
         rho=1.0,
         theta=np.pi / 180.0,
-        threshold=max(28, int(round(min_line_len * 0.45))),
+        threshold=max(20, int(round(min_line_len * 0.38))),
         minLineLength=min_line_len,
         maxLineGap=max_line_gap,
     )
@@ -294,13 +308,16 @@ def analyze_morphology(
             if length_px < min_line_len:
                 continue
 
-            line_mask = np.zeros((h, w), dtype=np.uint8)
-            cv2.line(line_mask, (x1, y1), (x2, y2), 255, thickness=max(3, base_k))
-            mean_resp = float(np.mean(masked_fold_resp[line_mask > 0]))
-            if mean_resp < min_abs_thresh * 0.90:
+            angle_deg = float(np.degrees(np.arctan2(y2 - y1, x2 - x1)) % 180.0)
+            if _is_printed_border_frame(x1, y1, x2, y2, length_px, angle_deg, h, w):
                 continue
 
-            angle_deg = float(np.degrees(np.arctan2(y2 - y1, x2 - x1)) % 180.0)
+            line_mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.line(line_mask, (x1, y1), (x2, y2), 255, thickness=max(2, base_k))
+            mean_resp = float(np.mean(masked_fold_resp[line_mask > 0]))
+            if mean_resp < min_abs_thresh * 0.85:
+                continue
+
             norm_len = length_px / float(max(1, h))
 
             raw_segments.append(
@@ -323,7 +340,7 @@ def analyze_morphology(
             (seg.x1, seg.y1),
             (seg.x2, seg.y2),
             255,
-            thickness=max(4, base_k + 1),
+            thickness=max(3, base_k),
         )
 
     # 4. Detect interior structural holes / voids (if any exist inside the note contour)
