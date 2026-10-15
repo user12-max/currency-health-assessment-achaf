@@ -76,7 +76,8 @@ def _refine_note_border_mask(
     When an image is already cropped or segmented with a bounding box, dark or uniform
     background triangles at torn corners or nicks along the edge may still be included
     inside the initial mask if the outer quad covered them. This helper inspects the
-    outer border against the central note distribution to expose missing corner/edge bites.
+    outer border against the central note distribution to expose missing corner/edge bites
+    for both dark and light background environments.
     """
     h, w = rectified_rgb.shape[:2]
     refined = (rectified_mask > 0).astype(np.uint8) * 255
@@ -84,39 +85,59 @@ def _refine_note_border_mask(
     lab = cv2.cvtColor(rectified_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
     gray = cv2.cvtColor(rectified_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
 
-    # Sample central interior note pixels to characterize note paper/ink distribution
+    # 1. Outer 2-pixel frame perimeter to inspect background characteristics
+    frame_mask = np.zeros((h, w), dtype=bool)
+    frame_mask[:2, :] = True
+    frame_mask[-2:, :] = True
+    frame_mask[:, :2] = True
+    frame_mask[:, -2:] = True
+
+    frame_gray = gray[frame_mask]
+    frame_median_gray = float(np.median(frame_gray))
+    frame_pixels_lab = lab[frame_mask]
+    frame_median_lab = np.median(frame_pixels_lab, axis=0)
+
+    # 2. Sample central interior note pixels to characterize note paper/ink distribution
     cy1, cy2 = int(h * 0.20), int(h * 0.80)
     cx1, cx2 = int(w * 0.20), int(w * 0.80)
     center_lab = lab[cy1:cy2, cx1:cx2].reshape(-1, 3)
     center_gray = gray[cy1:cy2, cx1:cx2].ravel()
 
+    med_center_gray = float(np.median(center_gray))
+    med_center_lab = np.median(center_lab, axis=0)
     p5_gray = float(np.percentile(center_gray, 3.0))
-    p98_gray = float(np.percentile(center_gray, 98.0))
-    med_lab = np.median(center_lab, axis=0)
-    std_lab = np.maximum(np.std(center_lab, axis=0), 8.0)
+    p95_gray = float(np.percentile(center_gray, 95.0))
 
-    # Check outer 12% perimeter for obvious background intrusions (very dark black border
-    # from perspective warp or strongly contrasting background at torn corners/edges)
+    contrast_dist = float(np.linalg.norm(med_center_lab - frame_median_lab))
+    gray_diff = frame_median_gray - med_center_gray
+
+    # If the outer frame has negligible contrast against the central note distribution,
+    # the note is full-bleed intact with no contrasting background encroachment
+    if contrast_dist < 18.0 and abs(gray_diff) < 20.0:
+        return refined
+
+    # 3. Check outer 15% perimeter for background intrusions (tears, curls, edge rolls)
     border_zone = np.zeros((h, w), dtype=bool)
-    bh = max(6, int(round(h * 0.14)))
-    bw = max(6, int(round(w * 0.14)))
+    bh = max(6, int(round(h * 0.15)))
+    bw = max(6, int(round(w * 0.15)))
     border_zone[:bh, :] = True
     border_zone[-bh:, :] = True
     border_zone[:, :bw] = True
     border_zone[:, -bw:] = True
 
-    # Pixels that are near-black (e.g., < max(12, p5_gray - 28)) or extreme background
-    # outliers connected to the outer image boundary
-    dark_bg = gray < max(12.0, p5_gray - 30.0)
-    z_dist = np.linalg.norm((lab - med_lab) / std_lab, axis=2)
-    # Smooth local variance: background voids at torn corners are typically smooth/uniform
-    local_mean = cv2.blur(gray, (7, 7))
-    local_sq = cv2.blur(gray * gray, (7, 7))
-    local_std = np.sqrt(np.maximum(0.0, local_sq - local_mean * local_mean))
+    lab_dist = np.linalg.norm(lab - frame_median_lab, axis=2)
 
-    candidate_bg = border_zone & (
-        dark_bg | ((z_dist > 4.2) & (local_std < 6.0))
-    )
+    if gray_diff > 20.0 or (frame_median_gray > 175.0 and med_center_gray < 165.0):
+        # Light / white background (e.g. note on paper, desk, or light surface)
+        bg_thresh = max(185.0, min(frame_median_gray - 8.0, p95_gray + 4.0))
+        candidate_bg = border_zone & ((gray >= bg_thresh) | (lab_dist < 16.0))
+    elif gray_diff < -20.0 or frame_median_gray < 60.0:
+        # Dark background (e.g. dark mat, slate, or perspective warp shadow)
+        bg_thresh = min(40.0, max(frame_median_gray + 15.0, p5_gray - 20.0))
+        candidate_bg = border_zone & ((gray <= bg_thresh) | (lab_dist < 16.0))
+    else:
+        # Distinct chromatic / colored background
+        candidate_bg = border_zone & (lab_dist < 14.0)
 
     # Only keep candidate background components that touch the 2-pixel outer frame
     cand_u8 = candidate_bg.astype(np.uint8) * 255
@@ -198,41 +219,29 @@ def analyze_edges_and_corners(
         missing_frac = float(1.0 - np.mean(eband))
 
         # Measure boundary displacement profile (distance from outer border to first foreground pixel)
-        if ename == "top":
-            has_fg = np.any(eband, axis=0)
-            first_idx = np.argmax(eband, axis=0).astype(np.float32)
-            first_idx[~has_fg] = float(band_h)
-            continuity = float(np.mean(first_idx <= max(2.0, band_h * 0.18)))
-            roughness = float(np.std(first_idx)) / max(1.0, float(band_h))
-        elif ename == "bottom":
-            flipped = eband[::-1, :]
-            has_fg = np.any(flipped, axis=0)
-            first_idx = np.argmax(flipped, axis=0).astype(np.float32)
-            first_idx[~has_fg] = float(band_h)
-            continuity = float(np.mean(first_idx <= max(2.0, band_h * 0.18)))
-            roughness = float(np.std(first_idx)) / max(1.0, float(band_h))
-        elif ename == "left":
-            has_fg = np.any(eband, axis=1)
-            first_idx = np.argmax(eband, axis=1).astype(np.float32)
-            first_idx[~has_fg] = float(band_w)
-            continuity = float(np.mean(first_idx <= max(2.0, band_w * 0.18)))
-            roughness = float(np.std(first_idx)) / max(1.0, float(band_w))
-        else:  # "right"
-            flipped = eband[:, ::-1]
-            has_fg = np.any(flipped, axis=1)
-            first_idx = np.argmax(flipped, axis=1).astype(np.float32)
-            first_idx[~has_fg] = float(band_w)
-            continuity = float(np.mean(first_idx <= max(2.0, band_w * 0.18)))
-            roughness = float(np.std(first_idx)) / max(1.0, float(band_w))
+        if ename in ("top", "bottom"):
+            dim = band_h
+            ax = 0
+            flipped = eband if ename == "top" else eband[::-1, :]
+        else:
+            dim = band_w
+            ax = 1
+            flipped = eband if ename == "left" else eband[:, ::-1]
+
+        has_fg = np.any(flipped, axis=ax)
+        first_idx = np.argmax(flipped, axis=ax).astype(np.float32)
+        first_idx[~has_fg] = float(dim)
+        continuity = float(np.mean(first_idx <= max(3.0, dim * 0.12)))
+        roughness = float(np.std(first_idx)) / max(1.0, float(dim))
 
         # Also check high-frequency jaggedness / tear notches along the edge strip
-        # Ignore small <=1.5% border tolerance from perspective discretization
-        eff_missing = max(0.0, missing_frac - 0.015)
+        # Ignore small <=1.2% border tolerance from perspective discretization
+        eff_missing = max(0.0, missing_frac - 0.012)
         eff_discontinuity = max(0.0, (1.0 - continuity) - 0.03)
-        eff_roughness = max(0.0, roughness - 0.04)
+        eff_roughness = max(0.0, roughness - 0.02)
 
         raw_wear = (
-            (eff_missing * 260.0) + (eff_discontinuity * 95.0) + (eff_roughness * 140.0)
+            (eff_missing * 250.0) + (eff_discontinuity * 80.0) + (eff_roughness * 120.0)
         ) * sens
         wear_score = float(np.clip(raw_wear, 0.0, 100.0))
         cond_score = float(np.clip(100.0 - wear_score, 0.0, 100.0))
