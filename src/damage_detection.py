@@ -161,7 +161,7 @@ def detect_edge_wear(
         expl = "Unable to reliably assess outer edge wear due to severe blur and unsegmented boundary."
     elif is_det:
         edge_str = ", ".join(affected_edges) if affected_edges else "outer perimeter"
-        expl = f"Boundary irregularity or missing margin detected along: {edge_str}."
+        expl = f"Boundary irregularity, edge rolling, or missing margin detected along: {edge_str}."
     else:
         expl = "All four external note boundaries appear continuous with minimal wear."
 
@@ -222,7 +222,7 @@ def detect_corner_damage(
         expl = "Unable to reliably assess corner geometry due to severe blur and unsegmented boundary."
     elif is_det:
         c_str = ", ".join(affected_corners) if affected_corners else "corner region"
-        expl = f"Corner deficit or dog-ear distortion detected at: {c_str}."
+        expl = f"Corner deficit, curled corner, or dog-ear distortion detected at: {c_str}."
     else:
         expl = "All four note corners retain expected rectangular geometry."
 
